@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -16,6 +17,10 @@ type gatewayCache struct {
 }
 
 func NewGatewayCache(rdb *redis.Client) service.GatewayCache {
+	return &gatewayCache{rdb: rdb}
+}
+
+func NewStickySessionCleaner(rdb *redis.Client) service.StickySessionCleaner {
 	return &gatewayCache{rdb: rdb}
 }
 
@@ -50,4 +55,53 @@ func (c *gatewayCache) RefreshSessionTTL(ctx context.Context, groupID int64, ses
 func (c *gatewayCache) DeleteSessionAccountID(ctx context.Context, groupID int64, sessionHash string) error {
 	key := buildSessionKey(groupID, sessionHash)
 	return c.rdb.Del(ctx, key).Err()
+}
+
+func (c *gatewayCache) DeleteSessionsByAccountID(ctx context.Context, accountID int64) (int64, error) {
+	if c == nil || c.rdb == nil || accountID <= 0 {
+		return 0, nil
+	}
+
+	target := strconv.FormatInt(accountID, 10)
+	var cursor uint64
+	var deleted int64
+
+	for {
+		keys, nextCursor, err := c.rdb.Scan(ctx, cursor, stickySessionPrefix+"*", 500).Result()
+		if err != nil {
+			return deleted, err
+		}
+		cursor = nextCursor
+
+		if len(keys) > 0 {
+			values, err := c.rdb.MGet(ctx, keys...).Result()
+			if err != nil {
+				return deleted, err
+			}
+
+			matchedKeys := make([]string, 0, len(keys))
+			for i, value := range values {
+				if value == nil {
+					continue
+				}
+				if fmt.Sprint(value) == target {
+					matchedKeys = append(matchedKeys, keys[i])
+				}
+			}
+
+			if len(matchedKeys) > 0 {
+				n, err := c.rdb.Del(ctx, matchedKeys...).Result()
+				if err != nil {
+					return deleted, err
+				}
+				deleted += n
+			}
+		}
+
+		if cursor == 0 {
+			break
+		}
+	}
+
+	return deleted, nil
 }

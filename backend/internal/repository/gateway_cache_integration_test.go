@@ -91,6 +91,30 @@ func (s *GatewayCacheSuite) TestDeleteSessionAccountID() {
 	require.True(s.T(), errors.Is(err, redis.Nil), "expected redis.Nil after delete")
 }
 
+func (s *GatewayCacheSuite) TestDeleteSessionsByAccountID() {
+	targetAccountID := int64(201)
+	otherAccountID := int64(202)
+	sessionTTL := 1 * time.Minute
+
+	require.NoError(s.T(), s.cache.SetSessionAccountID(s.ctx, 1, "target-a", targetAccountID, sessionTTL))
+	require.NoError(s.T(), s.cache.SetSessionAccountID(s.ctx, 2, "target-b", targetAccountID, sessionTTL))
+	require.NoError(s.T(), s.cache.SetSessionAccountID(s.ctx, 1, "other", otherAccountID, sessionTTL))
+
+	cleaner := NewStickySessionCleaner(s.rdb)
+	deleted, err := cleaner.DeleteSessionsByAccountID(s.ctx, targetAccountID)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int64(2), deleted)
+
+	_, err = s.cache.GetSessionAccountID(s.ctx, 1, "target-a")
+	require.True(s.T(), errors.Is(err, redis.Nil), "target-a should be deleted")
+	_, err = s.cache.GetSessionAccountID(s.ctx, 2, "target-b")
+	require.True(s.T(), errors.Is(err, redis.Nil), "target-b should be deleted")
+
+	got, err := s.cache.GetSessionAccountID(s.ctx, 1, "other")
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), otherAccountID, got)
+}
+
 func (s *GatewayCacheSuite) TestGetSessionAccountID_CorruptedValue() {
 	sessionID := "corrupted"
 	groupID := int64(1)

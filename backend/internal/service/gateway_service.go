@@ -400,6 +400,11 @@ type GatewayCache interface {
 	DeleteSessionAccountID(ctx context.Context, groupID int64, sessionHash string) error
 }
 
+// StickySessionCleaner clears sticky-session bindings by account.
+type StickySessionCleaner interface {
+	DeleteSessionsByAccountID(ctx context.Context, accountID int64) (int64, error)
+}
+
 // derefGroupID safely dereferences *int64 to int64, returning 0 if nil
 func derefGroupID(groupID *int64) int64 {
 	if groupID == nil {

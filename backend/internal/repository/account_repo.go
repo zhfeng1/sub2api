@@ -41,6 +41,7 @@ import (
 //   - client: Ent 客户端，用于类型安全的 ORM 操作
 //   - sql: 原生 SQL 执行器，用于复杂查询和批量操作
 //   - schedulerCache: 调度器缓存，用于在账号状态变更时同步快照
+//   - stickySessionCleaner: 粘性会话清理器，用于优先级变更后清除旧绑定
 type accountRepository struct {
 	client *dbent.Client // Ent ORM 客户端
 	sql    sqlExecutor   // 原生 SQL 执行接口
@@ -48,7 +49,8 @@ type accountRepository struct {
 	// 确保粘性会话能及时感知账号不可用状态。
 	// Used to proactively sync account snapshot to cache when status changes,
 	// ensuring sticky sessions can promptly detect unavailable accounts.
-	schedulerCache service.SchedulerCache
+	schedulerCache       service.SchedulerCache
+	stickySessionCleaner service.StickySessionCleaner
 }
 
 var schedulerNeutralExtraKeyPrefixes = []string{
@@ -66,14 +68,14 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 
 // NewAccountRepository 创建账户仓储实例。
 // 这是对外暴露的构造函数，返回接口类型以便于依赖注入。
-func NewAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache) service.AccountRepository {
-	return newAccountRepositoryWithSQL(client, sqlDB, schedulerCache)
+func NewAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCache service.SchedulerCache, stickySessionCleaner service.StickySessionCleaner) service.AccountRepository {
+	return newAccountRepositoryWithSQL(client, sqlDB, schedulerCache, stickySessionCleaner)
 }
 
 // newAccountRepositoryWithSQL 是内部构造函数，支持依赖注入 SQL 执行器。
 // 这种设计便于单元测试时注入 mock 对象。
-func newAccountRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, schedulerCache service.SchedulerCache) *accountRepository {
-	return &accountRepository{client: client, sql: sqlq, schedulerCache: schedulerCache}
+func newAccountRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, schedulerCache service.SchedulerCache, stickySessionCleaner service.StickySessionCleaner) *accountRepository {
+	return &accountRepository{client: client, sql: sqlq, schedulerCache: schedulerCache, stickySessionCleaner: stickySessionCleaner}
 }
 
 func (r *accountRepository) Create(ctx context.Context, account *service.Account) error {
@@ -318,6 +320,20 @@ func (r *accountRepository) Update(ctx context.Context, account *service.Account
 		return nil
 	}
 
+	previousPriority := account.Priority
+	priorityLoaded := false
+	if account.ID > 0 {
+		existing, err := r.client.Account.Query().
+			Where(dbaccount.IDEQ(account.ID)).
+			Select(dbaccount.FieldPriority).
+			Only(ctx)
+		if err != nil {
+			return translatePersistenceError(err, service.ErrAccountNotFound, nil)
+		}
+		previousPriority = existing.Priority
+		priorityLoaded = true
+	}
+
 	builder := r.client.Account.UpdateOneID(account.ID).
 		SetName(account.Name).
 		SetNillableNotes(account.Notes).
@@ -401,6 +417,9 @@ func (r *accountRepository) Update(ctx context.Context, account *service.Account
 	// 普通账号编辑（如 model_mapping / credentials）也需要立即刷新单账号快照，
 	// 否则网关在 outbox worker 延迟或异常时仍可能读到旧配置。
 	r.syncSchedulerAccountSnapshot(ctx, account.ID)
+	if priorityLoaded && previousPriority != account.Priority {
+		r.clearStickySessionsForAccounts(ctx, []int64{account.ID}, "priority_update")
+	}
 	return nil
 }
 
@@ -413,6 +432,32 @@ func (r *accountRepository) UpdateCredentials(ctx context.Context, id int64, cre
 	}
 	r.syncSchedulerAccountSnapshot(ctx, id)
 	return nil
+}
+
+func (r *accountRepository) clearStickySessionsForAccounts(ctx context.Context, accountIDs []int64, reason string) {
+	if r == nil || r.stickySessionCleaner == nil || len(accountIDs) == 0 {
+		return
+	}
+
+	seen := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if accountID <= 0 {
+			continue
+		}
+		if _, ok := seen[accountID]; ok {
+			continue
+		}
+		seen[accountID] = struct{}{}
+
+		deleted, err := r.stickySessionCleaner.DeleteSessionsByAccountID(ctx, accountID)
+		if err != nil {
+			logger.LegacyPrintf("repository.account", "[StickySession] clear failed: account=%d reason=%s err=%v", accountID, reason, err)
+			continue
+		}
+		if deleted > 0 {
+			logger.LegacyPrintf("repository.account", "[StickySession] cleared: account=%d reason=%s sessions=%d", accountID, reason, deleted)
+		}
+	}
 }
 
 func (r *accountRepository) Delete(ctx context.Context, id int64) error {
@@ -1472,6 +1517,9 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		}
 		if shouldSync {
 			r.syncSchedulerAccountSnapshots(ctx, ids)
+		}
+		if updates.Priority != nil {
+			r.clearStickySessionsForAccounts(ctx, ids, "bulk_priority_update")
 		}
 	}
 	return rows, nil

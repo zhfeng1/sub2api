@@ -16,9 +16,19 @@ import (
 
 type AccountRepoSuite struct {
 	suite.Suite
-	ctx    context.Context
-	client *dbent.Client
-	repo   *accountRepository
+	ctx            context.Context
+	client         *dbent.Client
+	repo           *accountRepository
+	stickyRecorder *stickySessionCleanerRecorder
+}
+
+type stickySessionCleanerRecorder struct {
+	accountIDs []int64
+}
+
+func (r *stickySessionCleanerRecorder) DeleteSessionsByAccountID(ctx context.Context, accountID int64) (int64, error) {
+	r.accountIDs = append(r.accountIDs, accountID)
+	return 1, nil
 }
 
 type schedulerCacheRecorder struct {
@@ -84,7 +94,8 @@ func (s *AccountRepoSuite) SetupTest() {
 	s.ctx = context.Background()
 	tx := testEntTx(s.T())
 	s.client = tx.Client()
-	s.repo = newAccountRepositoryWithSQL(s.client, tx, nil)
+	s.stickyRecorder = &stickySessionCleanerRecorder{}
+	s.repo = newAccountRepositoryWithSQL(s.client, tx, nil, s.stickyRecorder)
 }
 
 func TestAccountRepoSuite(t *testing.T) {
@@ -130,6 +141,27 @@ func (s *AccountRepoSuite) TestUpdate() {
 	got, err := s.repo.GetByID(s.ctx, account.ID)
 	s.Require().NoError(err, "GetByID after update")
 	s.Require().Equal("updated", got.Name)
+	s.Require().Empty(s.stickyRecorder.accountIDs)
+}
+
+func (s *AccountRepoSuite) TestUpdate_PriorityChangeClearsStickySessions() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "priority-change", Priority: 1})
+
+	account.Priority = 3
+	err := s.repo.Update(s.ctx, account)
+	s.Require().NoError(err, "Update")
+
+	s.Require().Equal([]int64{account.ID}, s.stickyRecorder.accountIDs)
+}
+
+func (s *AccountRepoSuite) TestUpdate_SamePriorityKeepsStickySessions() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "same-priority", Priority: 2})
+
+	account.Name = "same-priority-updated"
+	err := s.repo.Update(s.ctx, account)
+	s.Require().NoError(err, "Update")
+
+	s.Require().Empty(s.stickyRecorder.accountIDs)
 }
 
 func (s *AccountRepoSuite) TestUpdate_SyncSchedulerSnapshotOnDisabled() {
@@ -414,7 +446,7 @@ func (s *AccountRepoSuite) TestListWithFilters() {
 			// 每个 case 重新获取隔离资源
 			tx := testEntTx(s.T())
 			client := tx.Client()
-			repo := newAccountRepositoryWithSQL(client, tx, nil)
+			repo := newAccountRepositoryWithSQL(client, tx, nil, nil)
 			ctx := context.Background()
 
 			tt.setup(client)
@@ -938,6 +970,7 @@ func (s *AccountRepoSuite) TestBulkUpdate() {
 	got2, _ := s.repo.GetByID(s.ctx, a2.ID)
 	s.Require().Equal(99, got1.Priority)
 	s.Require().Equal(99, got2.Priority)
+	s.Require().ElementsMatch([]int64{a1.ID, a2.ID}, s.stickyRecorder.accountIDs)
 }
 
 func (s *AccountRepoSuite) TestBulkUpdate_MergeCredentials() {
